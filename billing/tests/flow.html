@@ -259,6 +259,32 @@ run('quantity trigger + delay damages (UI)', () => {
   g(55); nav('po/' + po.id + '?tab=billing'); T('after the GRN that crosses 100 it shows Fired · 115 cumulative', mainText().includes('Fired · 115 cumulative'));
   openMilestonePanel(m1.id); T('drawer names the firing GRN and the 15 surplus units going to M2', panelText().includes('Fired by GRN-') && panelText().includes('15 surplus unit(s) count toward M2'), panelText().slice(panelText().indexOf('Quantity trigger'), panelText().indexOf('Quantity trigger') + 300)); closePanel();
 });
+run('full journey: create PO → milestones → receipts → approve → invoice → pay (UI)', () => {
+  seedDb('default'); nav('pos'); click('[data-act="po-new"]');
+  setv('type', 'Goods'); setv('supplierId', 'sup1'); setv('title', 'Journey PO');
+  click('.panel [data-act="ln-add"]'); setv('lines.0.desc', 'Pumps'); setv('lines.0.qty', 100); setv('lines.0.price', 1000);
+  click('[data-act="po-method"][data-m="Milestone"]'); ui.f.milestones = []; render();
+  const ms = (name, qty) => { click('.panel [data-act="ms-add"]'); const f = $q('.overlay form'); f.querySelector('[name=name]').value = name; f.querySelector('[data-mode="lines"]').click(); const v = f.querySelector('#sc-rows [data-k="v"]'); v.value = qty; v.dispatchEvent(new Event('input', { bubbles: true })); f.querySelector('[name=allowPartial]').checked = true; submitModal(); };
+  ms('First batch', 60); ms('Second batch', 40);
+  T('both milestones saved, amounts 60,000 and 40,000', ui.f.milestones.length === 2 && panelText().includes('Fully assigned'), panelText().slice(panelText().indexOf('Coverage'), panelText().indexOf('Coverage') + 150));
+  click('[data-act="po-submit"]'); const po = db.pos.find(p => p.title === 'Journey PO'); T('PO created', !!po && msOf(po).map(m => m.amount).join() === '60000,40000');
+  ACT['po-approve']({ dataset: { id: po.id } }); submitModal(); const [m1, m2] = msOf(po);
+  nav('po/' + po.id + '?tab=billing'); click(`#main [data-act="ms-start"][data-id="${m1.id}"]`); T('M1 started from the schedule row', getMS(m1.id).status === 'In Progress');
+  openMilestonePanel(m1.id); ui.f.actualDate = todayISO(); click('.panel [data-act="ms-submit"]'); T('M1 submitted from its drawer', getMS(m1.id).status === 'Submitted for Approval');
+  click('.panel [data-act="ms-approve"]'); submitModal(); T('M1 approved', getMS(m1.id).status === 'Approved'); closePanel();
+  A.createGRN({ poId: po.id, lineId: po.lines[0].id, date: todayISO(), received: 30, rejected: 0, milestoneId: m1.id }, 'accept');
+  A.createGRN({ poId: po.id, lineId: po.lines[0].id, date: todayISO(), received: 20, rejected: 0, milestoneId: m1.id }, 'accept');
+  nav('po/' + po.id + '?tab=billing'); click(`#main [data-act="inv-new"][data-ms="${m1.id}"]`);
+  T('invoice drawer opens on M1 with the accepted 50,000 fetched', ui.f.alloc['milestone:' + m1.id] && ui.f.alloc['milestone:' + m1.id].value === 50000, ui.f.alloc);
+  setv('number', 'JRN-1'); click('[data-act="inv-save"][data-m="submit"]'); const inv = db.invoices.find(i => i.number === 'JRN-1');
+  T('invoice submitted, matched and routed for approval', inv && inv.status === 'Pending Approval' && inv.gross === 59000, inv && [inv.status, inv.gross]);
+  nav('invoice/' + inv.id); T('invoice page shows the allocation trace down to both GRNs, locked at submission', mainText().includes('Allocation trace') && mainText().includes('GRN-') && mainText().includes('locked at submission'));
+  ACT['inv-approve']({ dataset: { id: inv.id } }); submitModal(); T('approved', getInv(inv.id).status === 'Approved');
+  nav('ap'); ACT['inv-post']({ dataset: { id: inv.id } }); submitModal(); ACT['inv-pay']({ dataset: { id: inv.id } }); submitModal(); T('posted and paid', getInv(inv.id).status === 'Paid');
+  nav('po/' + po.id + '?tab=billing'); T('M1 shows Partially Invoiced with 10,000 still to bill once accepted', mainText().includes('Partially Invoiced') || getMS(m1.id) && msBilling(getMS(m1.id), po) === 'Partially Invoiced' || msBilling(getMS(m1.id), po) === 'Eligible');
+  A.createGRN({ poId: po.id, lineId: po.lines[0].id, date: todayISO(), received: 10, rejected: 0, milestoneId: m1.id }, 'accept');
+  openInvPanel({ poId: po.id, msId: m1.id }); T('after another GRN of 10 the remaining 10,000 is fetched for the second invoice', ui.f.alloc['milestone:' + m1.id] && ui.f.alloc['milestone:' + m1.id].value === 10000, ui.f.alloc); closePanel();
+});
 document.getElementById('out').textContent = log.join('\n') + '\n' + (log.some(l => l.startsWith('FAIL') || l.startsWith('ERR')) ? 'SOME FAILED' : 'ALL UI FLOWS PASSED');
 </script></body></html>
 

@@ -1,4 +1,4 @@
-﻿/* =====================================================================
+/* =====================================================================
    advances.js — guarantees, advances against a milestone (request → approval → invoice → recovery → refund),
    PO consumption (I + O), multi-line invoice intake, reports. No DOM access.
    An advance is part of a milestone's value paid early and recovered from the invoices that later bill that milestone — never extra money.
@@ -236,7 +236,7 @@ function reviewItems() {
 
 /* =====================================================================
    Multi-line invoice intake (spec 7.4–7.5). A supplier invoice arrives with N lines and no milestone references:
-   each line is matched to a PO line and a milestone slice, then checked in a fixed order. Results: Billable · Waiting · Reject.
+   each line is matched to a PO line and a milestone portion, then checked in a fixed order. Results: Billable · Waiting · Reject.
    ===================================================================== */
 const tokens = s => new Set(String(s || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(w => w.length > 2));
 function matchPoLine(po, r) {
@@ -260,8 +260,9 @@ function matchInvoiceLines(po, rows, opts = {}) {
     const key = [line.id, r.msId || '', row.qty, row.amount].join('|'), prev = seen.get(key);              // 2
     if (prev) return done('Reject', `Duplicate of line ${prev} on this invoice.`);
     seen.set(key, row.n);
+    if (r.uom && r.uom !== line.uom) { const f = +((line.convs || {})[r.uom]); if (!(f > 0)) return done('Reject', `Unit ${r.uom} differs from ${line.uom} and the PO line has no conversion factor.`); if (row.rate != null) row.rate = r2(row.rate / f); if (row.qty != null) row.qty = r2(row.qty * f); }   // I13
     if (row.rate != null) { const dev = line.price ? Math.abs(row.rate - line.price) / line.price * 100 : 0; if (dev > tol + 1e-9) return done('Reject', `Rate ${money(row.rate)} differs from the PO rate ${money(line.price)}${tol ? ` (tolerance ${tol}%)` : ''}.`); }   // 3
-    if (row.taxRate != null && row.taxRate !== gstOf(po)) return done('Reject', `Tax rate ${row.taxRate}% differs from the ${gstOf(po)}% on the PO.`);   // 6 (done early: a rejected line consumes nothing)
+    if (row.taxRate != null && row.taxRate !== (line.gstRate != null ? line.gstRate : gstOf(po))) return done('Reject', `Tax rate ${row.taxRate}% differs from the ${line.gstRate != null ? line.gstRate : gstOf(po)}% on the PO line.`);   // 6 (done early: a rejected line consumes nothing)
     let cap = 0, target = null, why = '';
     if (isOutside(line)) {                                                                                  // outside-schedule lines bill on accepted receipts
       const its = sourceItems(po, opts.exInv).filter(x => (x.kind === 'grn' || x.kind === 'srn') && x.line && x.line.id === line.id);
@@ -302,7 +303,7 @@ function matchInvoiceLines(po, rows, opts = {}) {
   const claimed = sum(res, x => x.amount), billable = sum(groups.Billable, x => x.billable);
   const allocs = [], byMs = new Map();
   groups.Billable.forEach(x => { if (x.msId) { if (!byMs.has(x.msId)) byMs.set(x.msId, []); byMs.get(x.msId).push(x); } });
-  byMs.forEach((list, msId) => allocs.push({ kind: 'milestone', refId: msId, qty: null, value: sum(list, x => x.billable), lines: list.map(x => ({ lineId: x.lineId, value: x.billable, qty: x.qtyBillable })) }));
+  byMs.forEach((list, msId) => allocs.push({ kind: 'milestone', refId: msId, qty: null, value: sum(list, x => x.billable), lines: list.map(x => ({ lineId: x.lineId, value: x.billable, qty: x.qtyBillable, ...(x.taxRate != null ? { gstRate: x.taxRate } : {}) })) }));
   const rc = new Map();
   groups.Billable.filter(x => x.allocKind === 'receipt').forEach(x => x.receipts.forEach(t => { const k = t.kind + ':' + t.refId, c = rc.get(k) || { kind: t.kind, refId: t.refId, qty: t.kind === 'grn' ? 0 : null, value: 0 }; c.value = r2(c.value + t.value); if (t.kind === 'grn') c.qty = r2(c.qty + t.qty); rc.set(k, c); }));
   rc.forEach(c => allocs.push(c));

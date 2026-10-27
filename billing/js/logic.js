@@ -202,6 +202,7 @@ const sliceInfo = (m, po) => (m.scope || []).map(x => {
   const kind = lineKind(po, line), value = x.value ?? sliceRaw(x, line);
   let acc = 0;
   if (x.basis === 'quantity') acc = kind === 'Goods' && poolLine(po, line.id) ? r2(poolShare(m, po, x) * line.price) : kind === 'Goods' ? sum((m.grnIds || []).map(getGRN).filter(g => g && g.lineId === line.id), g => recShare(m, g, 'grn') * line.price) : sum((m.srnIds || []).map(getSRN).filter(q => q && q.lineId === line.id), q => recShare(m, q, 'srn'));
+  if (m.measured && kind === 'Services' && x.basis !== 'quantity') { acc = sum((m.srnIds || []).map(getSRN).filter(q => q && q.lineId === line.id), q => recShare(m, q, 'srn')); return { s: x, line, kind, basis: x.basis, value, acc: r2(acc), ent: r2(Math.min(acc, value)) }; }   // I15 measured: bill the accepted service value only
   return { s: x, line, kind, basis: x.basis, value, acc: r2(acc), ent: x.basis === 'quantity' ? r2(Math.min(acc, value)) : value };
 }).filter(Boolean);
 const inScope = (m, lineId) => (m.scope || []).some(x => x.lineId === lineId);
@@ -395,6 +396,10 @@ function invoiceDue(po, received, accepted) {
   const t = dueTerms(po), base = t.basis === 'receipt' ? received : t.basis === 'acceptance' ? (accepted || received) : ((accepted || '') > received ? accepted : received);
   return { date: dpAdd(base, t.days), days: t.days, basis: t.basis, base };
 }
+/* PO line unit conversions: { Box: 12 } = 1 Box is 12 of the line's unit */
+const parseConvs = t => { const o = {}; String(t || '').split(/[,;\n]/).forEach(p => { const m = p.match(/^\s*(?:1\s*)?([^=]+?)\s*=\s*([\d.]+)/); if (m) o[m[1].trim()] = +m[2]; }); return o; };
+const convsStr = c => Object.entries(c || {}).map(([k, v]) => `${k}=${v}`).join(', ');
+const normConvs = c => { if (typeof c === 'string') c = parseConvs(c); const o = {}; Object.entries(c || {}).forEach(([k, v]) => { if (k && +v > 0) o[String(k)] = +v; }); return o; };
 /* a cumulative-quantity trigger needs a goods line, a threshold within the line quantity, and a quantity slice of that line in the milestone's own scope */
 function trigErrors(lines, m, code) {
   const t = m.trigger; if (!t || !t.lineId) return [];
@@ -428,7 +433,7 @@ const damagesCash = i => i && i.damages ? r2(i.damages.total || 0) : 0;
 /* the stored timing / dependency fields of a milestone; `dependsOn` (codes) is kept in step for older screens */
 function depFields(m) {
   const explicit = Array.isArray(m.deps), deps = depList(m).map(d => explicit || !d.legacy ? { pred: d.pred, type: d.type, lag: d.lag, effect: d.effect, state: d.state } : null).filter(Boolean);
-  return { ...(explicit ? { deps } : {}), dependsOn: depList(m).map(d => d.pred), trigger: m.trigger && m.trigger.lineId && +m.trigger.qty > 0 ? { lineId: m.trigger.lineId, qty: +m.trigger.qty } : null, damages: normDamages(m.damages), depJoin: m.depJoin === 'ANY' ? 'ANY' : 'ALL', durationDays: Math.max(0, Math.round(+m.durationDays || 0)), forecastDate: m.forecastDate || '', closing: !!m.closing };
+  return { ...(explicit ? { deps } : {}), dependsOn: depList(m).map(d => d.pred), measured: !!m.measured, trigger: m.trigger && m.trigger.lineId && +m.trigger.qty > 0 ? { lineId: m.trigger.lineId, qty: +m.trigger.qty } : null, damages: normDamages(m.damages), depJoin: m.depJoin === 'ANY' ? 'ANY' : 'ALL', durationDays: Math.max(0, Math.round(+m.durationDays || 0)), forecastDate: m.forecastDate || '', closing: !!m.closing };
 }
 /* builds the stored milestone from a draft definition + the derived schedule (amount, slice values) */
 const normAdvance = a => { a = a || {}; return { allowed: !!a.allowed, mode: a.mode === 'amount' ? 'amount' : 'percent', value: +a.value || 0, recovery: a.recovery === 'first' ? 'first' : 'proportional', guaranteeRequired: !!a.guaranteeRequired, guaranteeTitle: a.guaranteeRequired ? (String(a.guaranteeTitle || '').trim() || 'Advance payment guarantee') : '' }; };
@@ -613,15 +618,91 @@ function buildInvoice(d) {
   if (adv) { inv.advanceId = adv.id; inv.tdsDeducted = r2(adv.tds || 0); }
   inv.discountPct = Math.max(0, +d.discountPct || 0);
   inv.discount = r2(inv.net * inv.discountPct / 100);                 // discount is applied before tax; entitlement consumed stays the undiscounted net
-  const taxable = r2(inv.net - inv.discount), calc = (adv && poCfg(po).advanceGstMode === 'taxed_at_final') ? 0 : r2(taxable * inv.gstRate / 100);
+  const taxable = r2(inv.net - inv.discount); let calc = (adv && poCfg(po).advanceGstMode === 'taxed_at_final') ? 0 : r2(taxable * inv.gstRate / 100);
+  inv.taxMixed = false;                                               // I14: lines taxed at their own PO-line rate; the header is the sum of the lines
+  if (po && !adv && inv.allocs.some(a => (a.lines || []).some(x => (x.gstRate != null && x.gstRate !== '') || (lineOf(po, x.lineId) || {}).gstRate != null))) {
+    let g = 0; inv.taxMixed = true;
+    inv.allocs.forEach(a => { if (a.lines && a.lines.length) a.lines.forEach(x => { const l = lineOf(po, x.lineId) || {}, rate = x.gstRate != null && x.gstRate !== '' ? +x.gstRate : (l.gstRate != null ? l.gstRate : inv.gstRate); g += (+x.value || 0) * (1 - inv.discountPct / 100) * rate / 100; }); else g += (+a.value || 0) * (1 - inv.discountPct / 100) * inv.gstRate / 100; });
+    calc = r2(g);
+  }
+  inv.gstCalc = calc;
   inv.gst = (d.gstManual === null || d.gstManual === undefined || d.gstManual === '') ? calc : r2(d.gstManual);
   inv.tcs = r2(+d.tcs || 0); inv.roundOff = r2(+d.roundOff || 0);
   inv.gross = r2(taxable + inv.gst + inv.tcs + inv.roundOff);
   inv.recovery = computeRecoveries(inv);                              // advance recovery lines (negative) on milestone invoices
-  inv.damages = computeDamages(inv);                                  // delay damages (negative line, deducted from the payable)
+  inv.damages = computeDamages(inv);
+  inv.dueSplit = invoiceDueSplit(po, inv);                            // I02: several milestones on one invoice → due per milestone, header = earliest                                  // delay damages (negative line, deducted from the payable)
   return inv;
 }
 
+/* ===== invoice linking (brief I01–I20) =====
+   Every invoice line names a PO line and a milestone portion; consumption is an allocation record traceable down to the receipt line. */
+/* I11 rate · I13 unit of measure · I14 tax · I09 quantity — checks on the supplier's own lines (a.lines) */
+function lineLevelErrors(po, m, a, inv) {
+  const out = [], sr = sliceRemaining(m, po, inv.id), tol = +poCfg(po).valueTolerancePct || 0;
+  (a.lines || []).forEach(x => {
+    const l = lineOf(po, x.lineId), sl = l && sr.find(y => y.line.id === x.lineId), nm = l ? `L${l.no} ${l.desc}` : String(x.lineId);
+    if (!l || !sl) { out.push({ code: 'NO_SOURCE', msg: `${nm} is not in the scope of milestone ${m.code}.` }); return; }
+    let qty = x.qty != null && x.qty !== '' ? +x.qty : null, rate = x.rate != null && x.rate !== '' ? +x.rate : null;
+    if (qty != null && rate != null && Math.abs(r2(qty * rate) - r2(x.value)) > Math.max(1, r2(x.value * tol / 100))) out.push({ code: 'LINE', msg: `${nm}: ${fq(qty)} × ${money(rate)} = ${money(r2(qty * rate))}, but the line value is ${money(x.value)}.` });
+    if (x.uom && x.uom !== l.uom) {                                              // I13: convert with the PO line factor — none means blocked
+      const f = +((l.convs || {})[x.uom]);
+      if (!(f > 0)) { out.push({ code: 'UOM', msg: `${nm}: invoiced in ${x.uom} but the PO line is in ${l.uom} and defines no conversion factor — blocked until the PO line gets one.` }); return; }
+      if (qty != null) qty = r2(qty * f); if (rate != null) rate = r2(rate / f);
+    }
+    if (rate != null && l.price > 0 && Math.abs(rate - l.price) / l.price * 100 > tol + 1e-9) out.push({ code: 'RATE', msg: `${nm}: rate ${money(rate)} differs from the PO rate ${money(l.price)}${tol ? ` (tolerance ${tol}%)` : ''} — blocked; correct the invoice or amend the PO.` });
+    if (qty != null && sl.kind === 'Goods' && sl.basis === 'quantity' && l.price > 0) { const rem = r2(sl.remaining / l.price); if (qty > rem + EPS) out.push({ code: 'OVER_QTY', msg: `${nm}: invoice quantity ${fq(qty)} ${l.uom} is above the accepted, unbilled quantity of ${fq(rem)} ${l.uom} on ${m.code}.` }); }
+    if (x.gstRate != null && x.gstRate !== '') { const exp = l.gstRate != null ? l.gstRate : gstOf(po); if (+x.gstRate !== exp) out.push({ code: 'TAX', msg: `${nm}: taxed at ${x.gstRate}% but the PO line carries ${exp}%.` }); }
+  });
+  return out;
+}
+/* the receipts that can feed one portion, oldest acceptance first (I07); `prefer` lets the user put chosen receipts first before the invoice is submitted */
+function receiptFeed(m, po, sl, prefer = []) {
+  const line = sl.line, goods = sl.kind === 'Goods', pooled = goods && sl.basis === 'quantity' && poolLine(po, line.id);
+  const src = goods ? (pooled ? db.grns.filter(g => g.poId === po.id && g.lineId === line.id) : (m.grnIds || []).map(getGRN).filter(g => g && g.lineId === line.id)) : (m.srnIds || []).map(getSRN).filter(q => q && q.lineId === line.id);
+  const rank = r => { const i = prefer.indexOf(r.id); return i < 0 ? 999 : i; };
+  const recs = src.map(r => { const share = pooled ? grnEnt(r) : recShare(m, r, goods ? 'grn' : 'srn'); return share > 0 ? { kind: goods ? 'grn' : 'srn', rec: r, date: r.date || '', left: goods ? r2(share * line.price) : share, units: goods } : null; }).filter(Boolean)
+    .sort((a, b) => rank(a.rec) - rank(b.rec) || String(a.date).localeCompare(String(b.date)) || String(a.rec.number).localeCompare(String(b.rec.number)));
+  if (pooled) { let prior = r2(sum(msOf(po).filter(q => (q.seq || 0) < (m.seq || 0)), q => sum((q.scope || []).filter(s => s.lineId === line.id && s.basis === 'quantity'), s => +s.qty || 0)) * line.price); recs.forEach(r => { const t = Math.min(prior, r.left); r.left = r2(r.left - t); prior = r2(prior - t); }); }
+  return recs;
+}
+/* I05/I06/I07: trace each milestone allocation down to receipt lines. Receipts are consumed FIFO by acceptance date, replaying the milestone's earlier live invoices first, so the unused part of a receipt stays eligible. */
+function allocTrace(inv) {
+  const po = getPO(inv.poId), out = []; if (!po || po.billingMethod !== 'Milestone') return out;
+  (inv.allocs || []).forEach(a => {
+    if (a.kind !== 'milestone') return; const m = getMS(a.refId); if (!m) return;
+    const pools = sliceInfo(m, po).map(sl => ({ sl, used: 0, recs: receiptFeed(m, po, sl, a.recOrder || []) }));
+    const take = (p, v, rows) => { let rest = v; p.used = r2(p.used + v);
+      p.recs.forEach(rc => { if (rest <= EPS || rc.left <= EPS) return; const t = Math.min(rest, rc.left); rc.left = r2(rc.left - t); rest = r2(rest - t);
+        if (rows) rows.push({ kind: rc.kind, receipt: rc.rec.number, receiptId: rc.rec.id, date: rc.date, qty: rc.units ? r2(t / p.sl.line.price) : null, value: r2(t), partial: rc.left > EPS, left: rc.left }); });
+      if (rest > EPS && rows) rows.push({ kind: null, receipt: null, date: m.approvedAt ? String(m.approvedAt).slice(0, 10) : '', qty: null, value: r2(rest), partial: false, left: 0 }); };
+    const spread = (v) => { const parts = []; let rest = v; pools.forEach(p => { if (rest <= EPS) return; const cap = r2(Math.max(0, p.sl.ent - p.used)), t = Math.min(rest, cap); if (t > EPS) { parts.push({ p, v: r2(t) }); rest = r2(rest - t); } }); if (rest > EPS && pools.length) parts.push({ p: pools[pools.length - 1], v: r2(rest) }); return parts; };
+    const parts = x => (x.lines && x.lines.length) ? x.lines.map(q => ({ p: pools.find(p => p.sl.line.id === q.lineId), v: +q.value })).filter(q => q.p) : spread(+x.value);
+    db.invoices.filter(i => i.id !== inv.id && isLive(i) && (!inv.seq || (i.seq || 0) < inv.seq)).sort((x, y) => (x.seq || 0) - (y.seq || 0)).forEach(i => i.allocs.filter(q => q.kind === 'milestone' && q.refId === m.id).forEach(q => parts(q).forEach(z => take(z.p, z.v, null))));
+    parts(a).forEach(z => { const rows = []; take(z.p, z.v, rows); rows.forEach(r => out.push({ allocId: a.id, refId: m.id, msCode: m.code, lineNo: z.p.sl.line.no, line: z.p.sl.line.desc, ...r })); });
+  });
+  return out;
+}
+/* I02: due dates per milestone (later of receipt and acceptance + the PO's due days); the header carries the earliest */
+function invoiceDueSplit(po, inv) {
+  const ms = (inv.allocs || []).filter(a => a.kind === 'milestone'); if (!po || ms.length < 2) return null;
+  const rows = ms.map(a => { const m = getMS(a.refId); if (!m) return null; const dates = [m.approvedAt ? String(m.approvedAt).slice(0, 10) : '', ...[...(m.grnIds || []).map(getGRN), ...(m.srnIds || []).map(getSRN)].filter(Boolean).map(r => r.date || '')].filter(Boolean).sort();
+    return { msId: m.id, code: m.code, amount: a.value, due: invoiceDue(po, inv.date || todayISO(), dates.pop() || '').date }; }).filter(Boolean);
+  if (!rows.length) return null; const by = {}; rows.forEach(r => { by[r.due] = r2((by[r.due] || 0) + r.amount); });
+  const split = Object.entries(by).sort(([x], [y]) => x.localeCompare(y)).map(([due, amount]) => ({ due, amount }));
+  return { earliest: split[0].due, split, rows };
+}
+/* I18: a debit note on a milestone invoice is only for a variation covered by an approved PO amendment, and never lifts the milestone above its amount */
+function debitNoteErrors(inv, amount, variationRef) {
+  const po = getPO(inv.poId); if (!po || po.billingMethod !== 'Milestone') return '';
+  const am = (po.amendments || []).find(x => String(x.version) === String(variationRef) || x.id === variationRef);
+  if (!variationRef || !am) return `A debit note (or extra invoice) for a variation needs an approved PO amendment — enter the amendment version (${(po.amendments || []).length ? 'e.g. v' + po.amendments[0].version : 'this PO has none yet'}).`;
+  if (am.at && inv.submittedAt && am.at < inv.submittedAt) return `Amendment v${am.version} (${fmtD(am.at)}) is older than ${invRef(inv)} — a variation must be approved before it is billed.`;
+  const room = r2(sum(inv.allocs.filter(a => a.kind === 'milestone'), a => { const m = getMS(a.refId); return m ? Math.max(0, m.amount - usage('milestone', m.id).value) : 0; }));
+  const debits = r2(sum(adjOf(inv).filter(x => x.type === 'Debit'), x => x.amount)), base = r2(amount / (1 + gstOf(po) / 100));
+  if (base + debits > room + EPS) return `The debit would take the milestone above its amount — only ${money(room)} of milestone value remains. Raise the milestone by amendment first.`;
+  return '';
+}
 /* ---------- validation gate shared by form, submit and matching ---------- */
 function allocErrors(inv) {
   const po = getPO(inv.poId), errs = [], ex = inv.id;
@@ -656,6 +737,7 @@ function allocErrors(inv) {
       if (m.status === 'Approved') { const dep = unmetDeps(m, po, 'bill'); if (dep.length) return add('DEP', `Milestone ${m.code} depends on ${dep.map(d => d.code).join(', ')}: ${dep.map(d => d.why).join('; ')}. Dependency gate.`, it.label); }
       if (m.status !== 'Approved') return add('MS_NOT_APPROVED', `Milestone ${m.code} is not invoice-eligible: status is "${m.status}". Only an approved milestone can be invoiced; a passed due date does not make it eligible.`, it.label);
       if (!gate.ok) return add('GATE', `Milestone ${m.code} is approved but cannot be invoiced yet: ${gate.reason}. Approval does not replace the other acceptance conditions.`, it.label);
+      if (a.lines && a.lines.length) { const le = lineLevelErrors(po, m, a, inv); if (le.length) { le.forEach(e => add(e.code, e.msg, it.label)); return; } }
       if (!m.allowPartial) {
         if (it.usedValue <= EPS && it.entValue < m.amount - EPS) return add('GATE', `Milestone ${m.code} is approved but only ${money(it.entValue)} of ${money(m.amount)} is accepted so far, so it cannot be invoiced yet. Partial invoicing is not enabled on it — it is billed once, in full, after the remaining quantity is accepted.`, it.label);
         if (it.usedValue > EPS) return add('DUP_ALLOC', `Duplicate allocation blocked: milestone ${m.code} (${money(m.amount)}) is already invoiced on ${byInv}. Only one invoice is allowed per milestone.`, it.label);
@@ -728,6 +810,9 @@ function evaluateInvoice(inv) {
   else if (po.billingMethod === 'Standard') C('elig', eligLabel, 'pass', `Accepted receipts of ${money(sum(sourceItems(po, inv.id), x => x.entValue))} are available on the PO (standard receipt-based matching, no allocation schedule).`);
   else if (po.billingMethod === 'Milestone') C('elig', eligLabel, 'pass', `${refs.join(', ')} approved — ${inv.allocs.some(a => a.kind === 'milestone' && msGate(getMS(a.refId), po).required) ? 'every configured acceptance condition (document approval / accepted GRN / accepted SRN) is satisfied' : 'no extra acceptance condition configured'}.`);
   else C('elig', eligLabel, 'pass', `${refs.join(', ')} accepted and unconsumed — pending and rejected quantities excluded.`);
+  const eL = by('RATE', 'UOM', 'TAX', 'LINE');
+  if (eL.length) C('lines', 'Invoice line match (rate · unit · tax)', 'fail', eL.map(e => e.msg).join(' '));
+  else if (inv.allocs.some(a => a.lines && a.lines.length)) C('lines', 'Invoice line match (rate · unit · tax)', 'pass', `Every invoice line names a PO line and a milestone portion; rates, units and tax rates agree with the PO lines${inv.taxMixed ? ' (mixed tax rates — the header GST is the sum of the lines)' : ''}.`);
   const e2 = by('OVER_QTY', 'OVER_VALUE', 'MS_FULL', 'NET');
   if (e2.length) C('qty', 'Quantity / value match', 'fail', e2.map(e => e.msg).join(' '));
   else if (po.billingMethod === 'Standard') C('qty', 'Quantity / value match', 'pass', `Invoice amount ${money(inv.net)} ≤ accepted unbilled receipt value.`);
@@ -739,7 +824,7 @@ function evaluateInvoice(inv) {
   C('bal', 'PO remaining balance', eb.length ? 'fail' : 'pass', eb.length ? eb[0].msg : `PO ${money(poVal)} − other consumption (invoiced + unrecovered advance) ${money(otherLive)} − this invoice ${money(ownNet)} = ${money(poVal - otherLive - ownNet)} remaining.`);
   if (inv.damages && inv.damages.items.length) C('dmg', 'Delay damages', 'pass', inv.damages.items.map(x => `${x.code} finished ${x.lateDays} day(s) late = ${x.weeks} week(s) or part × ${x.ratePct}%${x.capped ? ' (capped at ' + x.capPct + '%)' : ''} = ${money(x.amount)}`).join('; ') + `; deducted from the payable (${money(payable(inv))}).`);
   if (inv.recovery && inv.recovery.items.length) C('adv', 'Advance recovery', 'pass', `Recovering ${money(inv.recovery.net)} of advance on this invoice${inv.recovery.gst ? ` (GST ${money(inv.recovery.gst)} reversed)` : ''}; cash payable ${money(payable(inv))}.`);
-  const exp = (inv.advanceId && poCfg(po).advanceGstMode === 'taxed_at_final') ? 0 : r2((inv.net - (inv.discount || 0)) * inv.gstRate / 100), diff = Math.abs(exp - inv.gst);
+  const exp = (inv.advanceId && poCfg(po).advanceGstMode === 'taxed_at_final') ? 0 : inv.taxMixed ? inv.gstCalc : r2((inv.net - (inv.discount || 0)) * inv.gstRate / 100), diff = Math.abs(exp - inv.gst);
   if (inv.gstRate !== gstOf(po)) C('gst', 'GST validation', 'fail', `GST rate ${inv.gstRate}% differs from the ${gstOf(po)}% on the PO.`);
   else if (diff <= 0.01) C('gst', 'GST validation', 'pass', `GST ${money(inv.gst)} = ${inv.gstRate}% of ${money(inv.net - (inv.discount || 0))}; total ${money(inv.gross)}.`);
   else if (diff <= 1) C('gst', 'GST validation', 'warn', `GST ${money(inv.gst)} differs from the computed ${money(exp)} by ${money(diff)} (within the ${money(1)} rounding tolerance).`);
@@ -819,7 +904,7 @@ A.savePO = (d, submit) => {
     supplierId: d.supplierId, buyer: d.buyer || 'DICE Manufacturing Pvt Ltd', office: d.office, title: d.title.trim(), poDate: d.poDate, deliveryDate: d.deliveryDate, endDate: d.endDate || '',
     type: d.type, category: d.category, attachments: d.attachments || [], currency: CURRENCY, gstRate: +d.gstRate, billingMethod: d.billingMethod, progressBasis: d.billingMethod === 'Progressive' ? d.progressBasis : 'Receipt',
     overReceiptPct: po.overReceiptPct || 0, status: submit ? 'Pending Approval' : 'Draft',
-    lines: d.lines.map((l, i) => ({ id: l.id || uid('ln'), no: i + 1, desc: l.desc.trim(), qty: +l.qty, uom: l.uom, price: +l.price, kind: d.type === 'Mixed' ? (l.kind === 'Services' ? 'Services' : 'Goods') : d.type, outside: d.billingMethod === 'Milestone' && !!l.outside })),
+    lines: d.lines.map((l, i) => ({ id: l.id || uid('ln'), no: i + 1, desc: l.desc.trim(), qty: +l.qty, uom: l.uom, price: +l.price, kind: d.type === 'Mixed' ? (l.kind === 'Services' ? 'Services' : 'Goods') : d.type, outside: d.billingMethod === 'Milestone' && !!l.outside, gstRate: l.gstRate !== '' && l.gstRate != null && GST_RATES.includes(+l.gstRate) ? +l.gstRate : null, convs: normConvs(l.convsText != null ? l.convsText : l.convs) })),
     settings: { ...PO_DEFAULTS, ...(d.settings || {}) }, scheduleOpen: null,
   });
   db.milestones = db.milestones.filter(m => m.poId !== po.id);          // schedule is only editable while the PO is a draft
@@ -942,7 +1027,7 @@ A.amendPO = (id, { lines, milestones, reason, settings }) => {
   return finishAmend(po, before, changes, reason);
 };
 /* edit one milestone's scope / gates / advance terms by amendment (spec 5.4.6: allowed only for slices with no reservation or invoice) */
-const PATCH_FIELDS = ['name', 'scope', 'needsDoc', 'docTitle', 'docApproverRole', 'needsGrn', 'needsSrn', 'autoSrn', 'allowPartial', 'requireCompleteQty', 'needsGuarantee', 'guaranteeTitle', 'advance', 'trigger'];
+const PATCH_FIELDS = ['name', 'scope', 'needsDoc', 'docTitle', 'docApproverRole', 'needsGrn', 'needsSrn', 'autoSrn', 'allowPartial', 'requireCompleteQty', 'needsGuarantee', 'guaranteeTitle', 'advance', 'trigger', 'measured'];
 A.amendMilestone = (poId, msId, patch, reason) => {
   const po = getPO(poId), m = getMS(msId);
   if (!po || po.status !== 'Approved' || po.billingMethod !== 'Milestone' || !m || m.poId !== po.id) return NO('Only a milestone of an approved Milestone PO can be amended.');
@@ -1307,6 +1392,7 @@ A.saveInvoice = (d, mode) => {                  // mode: 'draft' | 'submit'
   else if (b.date > todayISO()) errs.push(`Bill date ${fmtD(b.date)} is in the future.`);
   else if (po.poDate && b.date < po.poDate) errs.push(`Bill date ${fmtD(b.date)} is before the PO date ${fmtD(po.poDate)}.`);
   if (b.dueDate && b.date && b.dueDate < b.date) errs.push('Due date cannot be before the bill date.');
+  if (!b.dueDate && b.dueSplit) b.dueDate = b.dueSplit.earliest;
   if (d.discountPct !== '' && d.discountPct != null && (+d.discountPct < 0 || +d.discountPct > 100)) errs.push('Discount percent must be between 0 and 100.');
   const ca = (d.costAlloc && d.costAlloc.rows || []).filter(r => r.dept || +r.pct);
   if (ca.length && Math.abs(sum(ca, r => +r.pct) - 100) > 0.0001) errs.push(`Cost allocation percentages total ${fmtNum(sum(ca, r => +r.pct))}% — they must total 100%.`);
@@ -1329,10 +1415,11 @@ A.saveInvoice = (d, mode) => {                  // mode: 'draft' | 'submit'
   }
   const was = isLive(inv);
   if (d.idemKey) inv.idemKey = d.idemKey;
-  Object.assign(inv, { number: b.number.trim(), supplierId: po.supplierId, poId: po.id, method: po.billingMethod, date: b.date, dueDate: b.dueDate || '', net: b.net, gstRate: b.gstRate, discountPct: b.discountPct, discount: b.discount, gst: b.gst, tcs: b.tcs, roundOff: b.roundOff, gross: b.gross, gstCredit: !!d.gstCredit, createAsn: !!d.createAsn, costAlloc: d.costAlloc || { type: '', rows: [] }, remarks: d.remarks || '', attachments: d.attachments || [], allocs: b.allocs.map(a => ({ id: a.id || uid('al'), kind: a.kind, refId: a.refId, qty: a.qty ?? null, value: a.value, ...(a.lines && a.lines.length ? { lines: a.lines.map(x => ({ lineId: x.lineId, value: r2(x.value), qty: x.qty ?? null })) } : {}) })), recovery: b.recovery, damages: b.damages, advanceId: b.advanceId || null, tdsDeducted: b.tdsDeducted || 0 });
+  Object.assign(inv, { number: b.number.trim(), supplierId: po.supplierId, poId: po.id, method: po.billingMethod, date: b.date, dueDate: b.dueDate || '', net: b.net, gstRate: b.gstRate, discountPct: b.discountPct, discount: b.discount, gst: b.gst, tcs: b.tcs, roundOff: b.roundOff, gross: b.gross, gstCredit: !!d.gstCredit, createAsn: !!d.createAsn, costAlloc: d.costAlloc || { type: '', rows: [] }, remarks: d.remarks || '', attachments: d.attachments || [], allocs: b.allocs.map(a => ({ id: a.id || uid('al'), kind: a.kind, refId: a.refId, qty: a.qty ?? null, value: a.value, ...(a.recOrder && a.recOrder.length ? { recOrder: [...a.recOrder] } : {}), ...(a.lines && a.lines.length ? { lines: a.lines.map(x => ({ lineId: x.lineId, value: r2(x.value), qty: x.qty ?? null, ...(x.rate != null && x.rate !== '' ? { rate: +x.rate } : {}), ...(x.uom ? { uom: x.uom } : {}), ...(x.gstRate != null && x.gstRate !== '' ? { gstRate: +x.gstRate } : {}) })) } : {}) })), recovery: b.recovery, damages: b.damages, taxMixed: b.taxMixed, gstCalc: b.gstCalc, dueSplit: b.dueSplit, advanceId: b.advanceId || null, tdsDeducted: b.tdsDeducted || 0 });
   if (inv.advanceId && getAdv(inv.advanceId)) getAdv(inv.advanceId).invoiceId = inv.id;
   if (mode === 'draft') { audit(po.id, invRef(inv), `${invRef(inv)} saved as draft (no allocation reserved).`, 'inv'); save(); return OK(`${invRef(inv)} saved as draft`, { id: inv.id }); }
   inv.submittedAt = nowISO();
+  inv.allocs.forEach(a => { delete a.trace; }); { const tr = allocTrace(inv); inv.allocs.forEach(a => { a.trace = tr.filter(r => r.allocId === a.id || (r.refId === a.refId && a.kind === 'milestone')); }); }   // I07: the receipt feeding is locked once the invoice is submitted
   setStatus(inv, 'Submitted', 'Submitted by vendor'); audit(po.id, invRef(inv), `${invRef(inv)} (bill no. ${inv.number}) submitted for ${money(inv.gross)} total.`, 'inv');
   setStatus(inv, 'Pending Matching');
   if (d.autoMatch !== false) A.runMatching(inv.id, true);
@@ -1396,11 +1483,12 @@ A.reverseInvoice = (id, reason) => {
   inv.allocs.forEach(a => audit(inv.poId, invRef(inv), `Allocation reversed: ${allocText(a)} returned to the eligible balance (${invRef(inv)} reversed by credit note — ${reason}).`, 'alloc'));
   audit(inv.poId, invRef(inv), `${invRef(inv)} reversed via credit note of ${money(amt)}: ${reason}.`, 'bad'); save(); return OK(`${invRef(inv)} reversed — allocations released`);
 };
-A.addAdjustment = (id, { type, amount, reason }) => {
+A.addAdjustment = (id, { type, amount, reason, variationRef }) => {
   const inv = getInv(id); if (!inv || !APPROVED.includes(inv.status)) return NO('Adjustments apply to approved, posted or paid invoices.');
   amount = r2(amount); if (!(amount > 0)) return NO('Enter an amount greater than zero.'); if (!String(reason || '').trim()) return NO('A reason is required.');
   if (inv.advanceId && type === 'Credit') { /* a credit note never reduces the advance — only a refund does */ }
   if (type === 'Credit' && amount > payable(inv) + EPS) return NO(`Credit note cannot exceed the payable amount ${money(payable(inv))}.`);
-  db.adjustments.push({ id: uid('adj'), invoiceId: inv.id, type, amount, reason, at: nowISO(), by: actor() });
+  if (type === 'Debit') { const e = debitNoteErrors(inv, amount, variationRef); if (e) return NO(e); }
+  db.adjustments.push({ id: uid('adj'), invoiceId: inv.id, type, amount, reason, ...(variationRef ? { variationRef } : {}), at: nowISO(), by: actor() });
   audit(inv.poId, invRef(inv), `${type} note of ${money(amount)} recorded against ${invRef(inv)} (${reason}). Receipt/milestone entitlements are NOT restored automatically.`, 'inv'); save(); return OK(`${type} note recorded`);
 };

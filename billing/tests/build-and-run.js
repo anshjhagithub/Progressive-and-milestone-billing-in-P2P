@@ -10,3 +10,5 @@ const spec = ['core.js', 'logic.js', 'advances.js', 'seed.js'].map(f => fs.readF
 vm.runInNewContext(spec, { console, Date, Math, JSON, Number, String, Array, Set, Object, Intl });
 const deps = ['core.js', 'logic.js', 'advances.js', 'seed.js'].map(f => fs.readFileSync(path.join(dir, f), 'utf8')).join(String.fromCharCode(10)) + String.fromCharCode(10) + fs.readFileSync(path.join(__dirname, 'deps.test.js'), 'utf8');
 vm.runInNewContext(deps, { console, Date, Math, JSON, Number, String, Array, Set, Object, Intl });
+const link = ['core.js', 'logic.js', 'advances.js', 'seed.js'].map(f => fs.readFileSync(path.join(dir, f), 'utf8')).join(String.fromCharCode(10)) + String.fromCharCode(10) + fs.readFileSync(path.join(__dirname, 'link.test.js'), 'utf8');
+vm.runInNewContext(link, { console, Date, Math, JSON, Number, String, Array, Set, Object, Intl });
